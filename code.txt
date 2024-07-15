@@ -1,0 +1,541 @@
+#==============================The public metagenome raw data analysis===================================== 
+##01 download data
+nohup wget https://ddbj.nig.ac.jp/public/ddbj_database/dra/fastq/DRA006/DRA006684/DRX153398/DRR162779_1.fastq.bz2 &
+or
+~/software/SRAToolkit/sratoolkit.3.0.6-centos_linux64/bin/prefetch --option-file SRR_Acc_lst
+nohup ~/software/SRAToolkit/sratoolkit.3.0.6-centos_linux64/bin/prefetch --option-file SRR_Acc_List --output-directory ~/dataDL/HCC &
+##02 trimmomatic
+#~/software/java/jdk-20.0.2/bin/java -jar /software/trimmomatic/Trimmomatic-0.39/trimmomatic-0.39.jar PE -phred33 DRR127476_1.fastq.gz DRR127476_2.fastq.gz clean/DRR127476_1.fastq.gz clean/DRR127476_1_unpaird.fastq.gz clean/DRR127476_2.fastq.gz clean/DRR127476_2_unpaird.fastq.gz ILLUMINACLIP:TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+##03 kneaddata pipeline 
+kneaddata -i D84-1.R1.fastq.gz -i D84-1.R2.fastq.gz -o ./D84-1 --output-prefix D84-1 -t 20 -p 20 --cat-final-output --serial -db $KNEADDATA_DB_HUMAN_GENOME -db $KNEADDATA_DB_RNOR_6 -db $KNEADDATA_DB_RIBOSOMAL_RNA
+##04 HUNAnN3
+humann3 --input R1.fq --output R1  --metaphlan-options "--bowtie2db /humann_env/lib/python3.7/site-packages/metaphlan/metaphlan_databases --index mpa_vOct22_CHOCOPhlAnSGB_202212" 
+##05 megahit
+megahit -t 20 -1 R1_paired_1.fastq.gz  -2 R1_paired_2.fastq.gz -o R1
+##06 metawrap binning
+metawrap binning --metabat2 --maxbin2 --concoct -o metawrapbin -t 8 -a /assembly/*.fa /clean/*.fastq
+##07 bin_refinement
+metaWRAP bin_refinement  -o /binRefinement/bintest -t 10 -A /metawrapbin/metabat2_bins -B /metawrapbin/maxbin2_bins -C /metawrapbin/concoct_bins -c 50 -x 10
+##08 quant_bins
+metawrap quant_bins -b binRefinemen/metaWRAP_bins -t 8 -o quant_bins -a assembly/final_assembly.fasta clean/ERR*fastq
+##09 reassemble_bins
+metawrap reassemble_bins -o bin_reassemble -1 clean/all_reads_1.fastq -2 clean/all_reads_2.fastq -t 8 -m 800 -c 50 -x 10 -b bin_refinement/metaWRAP_bins
+#============================================Statistical Analysis===============================================
+##00Normalization
+otu <- read.delim('species_metaphlan.tsv',header = T,row.names = 1,sep = '\t')
+colSums(otu)
+Len<-as.numeric(length(rownames(otu)))
+Row<-as.numeric(length(colnames(otu)))
+id<-rep(colSums(otu),Len)
+bb<-matrix(id, nrow = Row, ncol = Len)
+bb<-as.data.frame(t(bb))
+rarefy_otu<-otu/bb*100
+colSums(rarefy_otu)
+write.csv(rarefy_otu,file="N_species_rarefy.csv")
+
+##01alpha diversity
+argv <- commandArgs(T)
+if(length(argv) != 2){stop("Rscript alpha-diversity.r [input table file] [out]")}
+dat<-read.table(argv[1],sep="\t",head=T,row.names=1,check.names=F);
+dat<-as.matrix(dat)
+result<-matrix(ncol=ncol(dat),nrow=4)
+result[1,]<-colnames(dat)
+for(i in 1:ncol(dat)){
+        x<-dat[ dat[,i]!=0,i]
+        F1=length(x[x==1])
+        F2=length(x[x==2])
+        result[2,i]<- length(x)+F1^2/(2*F2)
+        x.sum<-sum(x)
+        result[3,i]<- (-1)*sum( (x/x.sum)*log(x/x.sum) )
+        result[4,i]<- 1-sum( (x/x.sum)^2 )
+}
+result<-t(result)
+colnames(result)<-c("#Sample","#chao1","#Shannon-wiener-index","#Simpson-diversity-index")
+write.table(result,argv[2],quote = F,sep = "\t",row.names = F, col.names = T)
+##02 NMDS
+require(permute)
+require(lattice)
+library(vegan)
+library(ggplot2)
+library(dplyr)
+library("ggpubr")
+mydata <- read.table("species_metaphlan2.txt",header = T,
+                                     sep = "\t",row.names = 1,check.names = F,stringsAsFactors = F)
+mapping <- read.delim("group.txt",header = T,
+                      sep = "\t",stringsAsFactors = F)
+row.names(mapping) <- mapping[,1]
+bray_dist<-vegdist(mydata,method = "bray")
+
+df.nmds<-monoMDS(bray_dist,choices = T,labels=T,scaling = F)
+
+plot_data <- as.data.frame(df.nmds$points)
+plot_data <- merge(plot_data,mapping,by = 0)
+#PERMANOVA
+ado <- adonis(bray_dist~mapping[,2],permutations = 999,method = "bray",parallel = T)
+#ANOSIM
+anosim_result<-anosim(bray_dist,mapping$state,permutations = 999)
+centroids <- aggregate(cbind(MDS1,MDS2)~state,data=plot_data,mean)
+# merge centroid locations into ggplot dataframe
+plot_data <- merge(plot_data,centroids,by="state",suffixes=c("",".centroid"))
+# generate star plot...
+p1 <- ggplot(data=plot_data,aes(x=MDS1,y=MDS2,
+                                color=state,shape=state))+
+  geom_point(size=2,shape = 19)+
+  geom_segment(aes(x=MDS1.centroid,                      
+                   y=MDS2.centroid, xend=MDS1, 
+                   yend=MDS2, color=state)) +
+  geom_vline(xintercept = 0,lty="dashed")+                
+  geom_hline(yintercept = 0,lty="dashed")+                   
+  geom_label(aes(x = MDS1,y = MDS2,label = state,fill = state),
+             color = "black",
+             data=centroids, size=3) +
+  annotate("text", x = -2.5, y = -0.5, hjust = 0,
+           label = paste0("PERMANOVA:",
+                          "\nP.value: ",ado$aov.tab[6][[1,1]],
+                          "\nR: ",round(ado$aov.tab[5][[1,1]],4)),size = 3)+
+  geom_text(aes(x=-2,y=-1,label="stress = 0.1741559"),size = 3) +
+  scale_fill_manual(values=c('#cc88b0','#998db7','#87b5b2','#f4ceb4')) +
+  scale_color_manual(values=c('#cc88b0','#998db7','#87b5b2','#f4ceb4'))+
+  theme_bw()+
+  theme(panel.grid = element_blank(),legend.position = "none")+
+  theme(plot.title = element_text(hjust = 0.5, vjust = 1))。
+ ##03 Accumulative bar diagram
+spe <- read.delim('species_metaphlan2.txt',
+                  row.names = 1,sep = '\t', stringsAsFactors = FALSE, check.names = FALSE)
+spe <- as.data.frame(t(spe))
+tax <- read.delim('tax.txt')
+group <- read.delim('group.txt')
+
+spe$sum <- rowSums(spe)
+spe <- spe[order(spe$sum, decreasing = TRUE), ]
+spe_top10 <- spe[1:10, -ncol(spe)]
+spe_top10['Others', ] <- 100 - colSums(spe_top10)
+spe_top10 <- as.data.frame(t(spe_top10))
+spe_top10$names <- rownames(spe_top10)
+merge_data <- merge(spe_top10, group, by = "names" )
+write.csv(merge_data, 'species_top10.csv', quote = FALSE)
+
+phylum_top10 <- read.delim('species_top10.csv',
+                           row.names = 1, sep = ',', stringsAsFactors = FALSE, check.names = FALSE)
+phylum_top10$Taxonomy <- factor(rownames(phylum_top10), levels = rev(rownames(phylum_top10)))
+phylum_top10 <- melt(phylum_top10, id = 'Taxonomy')
+p <- ggplot(phylum_top10, aes(variable, value, fill = Taxonomy)) +
+  geom_col(position = 'stack', width = 0.6) +
+  labs(x = '', y = 'Relative Abundance(%)') +
+  theme(axis.text = element_text(size = 12), axis.title = element_text(size = 13)) +
+  theme(legend.text = element_text(size = 11))
+p +
+  scale_fill_manual(values =  rev(c("#08519c","#2271b6","#6bafd6",
+                                             "#9ecbe2","#d7e3ef","#f7fbff",
+                                             "#cb181c","#fb6a4b",
+                                             "#fd9272","#fcbba1","#fee1d3"))) +
+                                            theme(panel.grid = element_blank(), 
+                                                  panel.background = element_rect(color = 'black', fill = 'transparent')) +
+  theme(legend.title = element_blank())
+##04 Differential analysis
+library(rstatix)
+library(tidyverse)
+myotu <- read.delim('species_metaphlan2.txt',
+                    row.names = 1,sep = '\t', stringsAsFactors = FALSE, check.names = FALSE)
+myotu$names <- row.names(myotu)
+mapping <- read.delim("group.txt",header = T,
+                      sep = "\t",stringsAsFactors = F)
+mydata <- merge(myotu,mapping,by = "names")
+#==========
+HC <- filter(mydata, state == "CK" | state == "CRC")
+#write.csv(HC,"HC.csv")
+rownames(HC) <- HC[, 1]
+HC <- HC[, -1]
+HC <- as.data.frame(t(HC))
+HC <- HC[, c(ncol(HC), 1:(ncol(HC)-1))]
+colnames(HC) <- HC[nrow(HC), ]
+HC <- HC[-nrow(HC), ]
+HC <- HC[, order(colnames(HC))]
+HC <- cbind(HC, species = rownames(HC))
+wilco_res <- NULL
+for(i in 1:nrow(HC)){
+  abun_CK <- as.numeric(HC[i,1:123])
+  abun_CRC <- as.numeric(HC[i,124:334])
+  wilcox <- wilcox.test(abun_CK,abun_CRC,exact=FALSE)$p.value
+  median_CK <- median(abun_CK)
+  median_CRC <- median(abun_CRC)
+  occ_CK <- length(which(abun_CK>0))
+  occ_CRC <- length(which(abun_CRC>0))
+  enrich <- ifelse(median_CK > median_CRC,"enrichCK","enrichCRC")
+  res <- data.frame(median_CK,median_CRC,occ_CK,occ_CRC,enrich,wilcox)
+  wilco_res <- rbind(wilco_res,res)
+}
+wilco_res$species=HC$species
+write.csv(wilco_res,"HCwilcox.csv")
+
+#FDR_qvalue
+data <- read.delim('HCwilcox.csv',
+                   row.names = 1, sep = '\t', stringsAsFactors = FALSE, check.names = FALSE)
+qvalue_res <- NULL
+for(i in 1:nrow(data)){
+  qvalue <- p.adjust(data[i,6],method="fdr",n=length(data[i,]))
+  res <- data.frame(qvalue)
+  qvalue_res <- rbind(qvalue_res,res)
+}
+data1 <- cbind(data, qvalue_res$qvalue)
+colnames(data1)[10] <- "qvalue"
+#write.csv(data1,'HCqvalue2.csv')
+
+data1 <- data1[data1$change != 0, ]
+data1 <- data1[data1$change != Inf, ]
+res1 <- data1[order(data1$qvalue),] 
+res1 <- data1[order(data1$change, decreasing = TRUE), ]
+res1$changed <- factor(ifelse(res1$qvalue < 0.05 & abs(res1$change) > 1 & res1$enrich == 'enrichCRC', 'up',
+                              ifelse(res1$change > 1 & res1$enrich == 'enrichCK','down','none')))
+res1$enrich <- "health-CRC"
+colnames(res1)[5] <- "group"
+HC_Final <- subset(res1, select = -c(1:4, 6:8))
+write.csv(HC_Final,'00HC_Final.csv')
+
+
+##HA
+HA <- filter(mydata, state == "CK" | state == "ADE")
+#write.csv(HA,"HA.csv")
+rownames(HA) <- HA[, 1]
+HA <- HA[, -1]
+HA <- as.data.frame(t(HA))
+HA <- HA[, c(ncol(HA), 1:(ncol(HA)-1))]
+colnames(HA) <- HA[nrow(HA), ]
+HA <- HA[-nrow(HA), ]
+HA <- HA[, order(colnames(HA))]
+HA <- cbind(HA, species = rownames(HA))
+wilco_res <- NULL
+for(i in 1:nrow(HA)){
+  abun_ADE <- as.numeric(HA[i,1:40])
+  abun_CK <- as.numeric(HA[i,41:163])
+  wilcox <- wilcox.test(abun_ADE,abun_CK,exact=FALSE)$p.value
+  median_ADE <- median(abun_ADE)
+  median_CK <- median(abun_CK)
+  occ_CK <- length(which(abun_CK>0))
+  occ_ADE <- length(which(abun_ADE>0))
+  enrich <- ifelse(median_CK > median_ADE,"enrichCK","enrichADE")
+  res <- data.frame(median_CK,median_ADE,occ_CK,occ_ADE,enrich,wilcox)
+  wilco_res <- rbind(wilco_res,res)
+}
+wilco_res$species=HA$species
+write.csv(wilco_res,"HAwilcox.csv")
+#=========
+#FDR_qvalue
+data <- read.delim('HAwilcox.csv',
+                   row.names = 1, sep = '\t', stringsAsFactors = FALSE, check.names = FALSE)
+qvalue_res <- NULL
+for(i in 1:nrow(data)){
+  qvalue <- p.adjust(data[i,6],method="fdr",n=length(data[i,]))
+  res <- data.frame(qvalue)
+  qvalue_res <- rbind(qvalue_res,res)
+}
+data1 <- cbind(data, qvalue_res$qvalue)
+colnames(data1)[10] <- "qvalue"
+#write.csv(data1,'HAqvalue.csv')
+
+data1 <- data1[data1$change != 0, ]
+data1 <- data1[data1$change != Inf, ]
+res1 <- data1[order(data1$qvalue),] 
+res1 <- data1[order(data1$change, decreasing = TRUE), ]
+res1$changed <- factor(ifelse(res1$qvalue < 0.05 & abs(res1$change) > 1 & res1$enrich == 'enrichADE', 'up',
+                              ifelse(res1$change > 1 & res1$enrich == 'enrichCK','down','none')))
+res1$enrich <- "health-ADE"
+colnames(res1)[5] <- "group"
+HA_Final <- subset(res1, select = -c(1:4, 6:8))
+write.csv(HA_Final,'00HA_Final.csv')
+
+HH <- filter(mydata, state == "CK" | state == "HCC")
+write.csv(HH,"HH.csv")
+rownames(HH) <- HH[, 1]
+HH <- HH[, -1]
+HH <- as.data.frame(t(HH))
+HH <- HH[, c(ncol(HH), 1:(ncol(HH)-1))]
+colnames(HH) <- HH[nrow(HH), ]
+HH <- HH[-nrow(HH), ]
+HH <- HH[, order(colnames(HH))]
+HH <- cbind(HH, species = rownames(HH))
+wilco_res <- NULL
+for(i in 1:nrow(HH)){
+  abun_CK <- as.numeric(HH[i,1:123])
+  abun_HCC <- as.numeric(HH[i,124:128])
+  wilcox <- wilcox.test(abun_CK,abun_HCC,exact=FALSE)$p.value
+  median_HCC <- median(abun_HCC)
+  median_CK <- median(abun_CK)
+  occ_CK <- length(which(abun_CK>0))
+  occ_HCC <- length(which(abun_HCC>0))
+  enrich <- ifelse(median_CK > median_HCC,"enrichCK","enrichHCC")
+  res <- data.frame(median_CK,median_HCC,occ_CK,occ_HCC,enrich,wilcox)
+  wilco_res <- rbind(wilco_res,res)
+}
+wilco_res$species=HH$species
+write.csv(wilco_res,"HHwilcox.csv")
+#==========
+#FDR_qvalue
+data <- read.delim('HHwilcox.csv',
+                   row.names = 1, sep = '\t', stringsAsFactors = FALSE, check.names = FALSE)
+qvalue_res <- NULL
+for(i in 1:nrow(data)){
+  qvalue <- p.adjust(data[i,6],method="fdr",n=length(data[i,]))
+  res <- data.frame(qvalue)
+  qvalue_res <- rbind(qvalue_res,res)
+}
+data1 <- cbind(data, qvalue_res$qvalue)
+colnames(data1)[10] <- "qvalue"
+#write.csv(data1,'HHqvalue.csv')
+
+data1 <- data1[data1$change != 0, ]
+data1 <- data1[data1$change != Inf, ]
+res1 <- data1[order(data1$qvalue),] 
+res1 <- data1[order(data1$change, decreasing = TRUE), ]
+res1$changed <- factor(ifelse(res1$qvalue < 0.05 & abs(res1$change) > 1 & res1$enrich == 'enrichHCC', 'up',
+                              ifelse(res1$change > 1 & res1$enrich == 'enrichCK','down','none')))
+res1$enrich <- "health-HCC"
+colnames(res1)[5] <- "group"
+HH_Final <- subset(res1, select = -c(1:4, 6:8))
+write.csv(HH_Final,'00HH_Final.csv')
+
+
+CA <- filter(mydata, state == "ADE" | state == "CRC")
+#write.csv(CA,"CA.csv")
+rownames(CA) <- CA[, 1]
+CA <- CA[, -1]
+CA <- as.data.frame(t(CA))
+CA <- CA[, c(ncol(CA), 1:(ncol(CA)-1))]
+colnames(CA) <- CA[nrow(CA), ]
+CA <- CA[-nrow(CA), ]
+CA <- CA[, order(colnames(CA))]
+CA <- cbind(CA, species = rownames(CA))
+wilco_res <- NULL
+for(i in 1:nrow(CA)){
+  abun_ADE <- as.numeric(CA[i,1:40])
+  abun_CRC <- as.numeric(CA[i,41:251])
+  wilcox <- wilcox.test(abun_ADE,abun_CRC,exact=FALSE)$p.value
+  median_ADE <- median(abun_ADE)
+  median_CRC <- median(abun_CRC)
+  occ_ADE <- length(which(abun_ADE>0))
+  occ_CRC <- length(which(abun_CRC>0))
+  enrich <- ifelse(median_ADE > median_CRC,"enrichADE","enrichCRC")
+  res <- data.frame(median_ADE,median_CRC,occ_ADE,occ_CRC,enrich,wilcox)
+  wilco_res <- rbind(wilco_res,res)
+}
+wilco_res$species=CA$species
+write.csv(wilco_res,"CAwilcox.csv")
+
+#=======
+#FDR_qvalue
+data <- read.delim('CAwilcox.csv',
+                   row.names = 1, sep = '\t', stringsAsFactors = FALSE, check.names = FALSE)
+qvalue_res <- NULL
+for(i in 1:nrow(data)){
+  qvalue <- p.adjust(data[i,6],method="fdr",n=length(data[i,]))
+  res <- data.frame(qvalue)
+  qvalue_res <- rbind(qvalue_res,res)
+}
+data1 <- cbind(data, qvalue_res$qvalue)
+colnames(data1)[10] <- "qvalue"
+#write.csv(data1,'CAqvalue.csv')
+
+data1 <- data1[data1$change != 0, ]
+data1 <- data1[data1$change != Inf, ]
+res1 <- data1[order(data1$qvalue),] 
+res1 <- data1[order(data1$change, decreasing = TRUE), ]
+res1$changed <- factor(ifelse(res1$qvalue < 0.05 & abs(res1$change) > 1 & res1$enrich == 'enrichADE', 'up',
+                              ifelse(res1$change > 1 & res1$enrich == 'enrichCRC','down','none')))
+res1$enrich <- "ADE-CRC"
+colnames(res1)[5] <- "group"
+CA_Final <- subset(res1, select = -c(1:4, 6:8))
+write.csv(CA_Final,'00CA_Final.csv')
+
+
+CH <- filter(mydata, state == "HCC" | state == "CRC")
+write.csv(CH,"CH.csv")
+rownames(CH) <- CH[, 1]
+CH <- CH[, -1]
+CH <- as.data.frame(t(CH))
+CH <- CH[, c(ncol(CH), 1:(ncol(CH)-1))]
+colnames(CH) <- CH[nrow(CH), ]
+CH <- CH[-nrow(CH), ]
+CH <- CH[, order(colnames(CH))]
+CH <- cbind(CH, species = rownames(CH))
+wilco_res <- NULL
+for(i in 1:nrow(CH)){
+  abun_CRC <- as.numeric(CH[i,1:211])
+  abun_HCC <- as.numeric(CH[i,212:216])
+  wilcox <- wilcox.test(abun_CRC,abun_HCC,exact=FALSE)$p.value
+  median_CRC <- median(abun_HCC)
+  median_HCC <- median(abun_HCC)
+  occ_CRC <- length(which(abun_CRC>0))
+  occ_HCC <- length(which(abun_HCC>0))
+  enrich <- ifelse(median_CRC > median_HCC,"enrichCRC","enrichHCC")
+  res <- data.frame(median_CRC,median_HCC,occ_CRC,occ_HCC,enrich,wilcox)
+  wilco_res <- rbind(wilco_res,res)
+}
+wilco_res$species=CH$species
+write.csv(wilco_res,"CHwilcox.csv")
+
+#=====
+#FDR_qvalue
+data <- read.delim('CHwilcox.csv',
+                   row.names = 1, sep = '\t', stringsAsFactors = FALSE, check.names = FALSE)
+qvalue_res <- NULL
+for(i in 1:nrow(data)){
+  qvalue <- p.adjust(data[i,6],method="fdr",n=length(data[i,]))
+  res <- data.frame(qvalue)
+  qvalue_res <- rbind(qvalue_res,res)
+}
+data1 <- cbind(data, qvalue_res$qvalue)
+colnames(data1)[10] <- "qvalue"
+#write.csv(data1,'CHqvalue.csv')
+
+data1 <- data1[data1$change != 0, ]
+data1 <- data1[data1$change != Inf, ]
+res1 <- data1[order(data1$qvalue),] 
+res1 <- data1[order(data1$change, decreasing = TRUE), ]
+res1$changed <- factor(ifelse(res1$qvalue < 0.05 & abs(res1$change) > 1 & res1$enrich == 'enrichHCC', 'up',
+                              ifelse(res1$change > 1 & res1$enrich == 'enrichCRC','down','none')))
+res1$enrich <- "HCC-CRC"
+colnames(res1)[5] <- "group"
+CH_Final <- subset(res1, select = -c(1:4, 6:8))
+write.csv(CH_Final,'00CH_Final.csv')
+
+AH <- filter(mydata, state == "ADE" | state == "HCC")
+write.csv(AH,"AH.csv")
+rownames(AH) <- AH[, 1]
+AH <- AH[, -1]
+AH <- as.data.frame(t(AH))
+AH <- AH[, c(ncol(AH), 1:(ncol(AH)-1))]
+colnames(AH) <- AH[nrow(AH), ]
+AH <- AH[-nrow(AH), ]
+AH <- AH[, order(colnames(AH))]
+AH <- cbind(AH, species = rownames(AH))
+wilco_res <- NULL
+ for(i in 1:nrow(AH)){
+  abun_ADE <- as.numeric(AH[i,1:40])
+  abun_HCC <- as.numeric(AH[i,41:45])
+  wilcox <- wilcox.test(abun_ADE,abun_HCC,exact=FALSE)$p.value
+  median_ADE <- median(abun_ADE)
+  median_HCC <- median(abun_HCC)
+  occ_ADE <- length(which(abun_ADE>0))
+  occ_HCC <- length(which(abun_HCC>0))
+  enrich <- ifelse(median_ADE > median_HCC,"enrichADE","enrichHCC")
+  res <- data.frame(median_ADE,median_HCC,occ_ADE,occ_HCC,enrich,wilcox)
+  wilco_res <- rbind(wilco_res,res)
+}
+wilco_res$species=AH$species
+write.csv(wilco_res,"AHwilcox.csv")
+
+#====
+#FDR_qvalue
+data <- read.delim('AHwilcox.csv',
+                   row.names = 1, sep = '\t', stringsAsFactors = FALSE, check.names = FALSE)
+qvalue_res <- NULL
+for(i in 1:nrow(data)){
+  qvalue <- p.adjust(data[i,6],method="fdr",n=length(data[i,]))
+  res <- data.frame(qvalue)
+  qvalue_res <- rbind(qvalue_res,res)
+}
+data1 <- cbind(data, qvalue_res$qvalue)
+colnames(data1)[10] <- "qvalue"
+#write.csv(data1,'AHqvalue.csv')
+
+data1 <- data1[data1$change != 0, ]
+data1 <- data1[data1$change != Inf, ]
+res1 <- data1[order(data1$qvalue),] 
+res1 <- data1[order(data1$change, decreasing = TRUE), ]
+res1$changed <- factor(ifelse(res1$qvalue < 0.05 & abs(res1$change) > 1 & res1$enrich == 'enrichHCC', 'up',
+                              ifelse(res1$change > 1 & res1$enrich == 'enrichADE','down','none')))
+res1$enrich <- "HCC-ADE"
+colnames(res1)[5] <- "group"
+AH_Final <- subset(res1, select = -c(1:4, 6:8))
+write.csv(AH_Final,'00AH_Final.csv')
+
+#=======================
+library(ggplot2) # Create Elegant Data Visualisations Using the Grammar of Graphics
+library(dplyr) # A Grammar of Data Manipulation
+library(RColorBrewer) # ColorBrewer Palettes
+library(grid) # The Grid Graphics Package
+library(scales) # Scale Functions for Visualization
+
+AH <- read.delim('00AH_Final.csv',
+                sep = ',', stringsAsFactors = FALSE, check.names = FALSE)
+CA <- read.delim('00CA_Final.csv',
+                 sep = ',', stringsAsFactors = FALSE, check.names = FALSE)
+CH <- read.delim('00CH_Final.csv',
+                 sep = ',', stringsAsFactors = FALSE, check.names = FALSE)
+HA <- read.delim('00HA_Final.csv',
+                 sep = ',', stringsAsFactors = FALSE, check.names = FALSE)
+
+HC <- read.delim('00HC_Final.csv',
+                 sep = ',', stringsAsFactors = FALSE, check.names = FALSE)
+HH <- read.delim('00HH_Final.csv',
+                 sep = ',', stringsAsFactors = FALSE, check.names = FALSE)
+df_combined <- rbind(AH, CA, CH, HA, HC, HH)
+
+df_combined <- na.omit(df_combined)
+idx <- df_combined$changed == "down"
+df_combined$change[idx] <- -abs(df_combined$change[idx])
+names(df_combined)[which(names(df_combined) == "")] <- "species"
+df_bg <- df_combined %>%
+  group_by(group) %>%
+  summarize(max_log2FC = max(change),min_log2FC = min(change))
+
+ggplot()+
+  geom_col(data = df_bg, 
+           mapping = aes(group,max_log2FC),
+           fill = "grey85", width = 0.8, alpha = 0.5) +
+  geom_col(data = df_bg, 
+           mapping = aes(group, min_log2FC),
+           fill = "grey85", width = 0.8, alpha = 0.5) +
+  geom_jitter(data = df_combined,
+                    mapping = aes(x = group, y = change, color = changed),
+                    size= 3,width =0.4, alpha = 0.7) +
+  geom_col(data = df_bg,
+           mapping = aes(x= group, y = 0.1, fill = group),
+           width = 1)+
+  geom_col(data = df_bg,
+           mapping = aes(x= group, y = -0.9, fill = group),
+           width = 1)+
+  geom_text(data=df_bg,
+            mapping = aes(x=group, y=-0.5, label=group),
+            size = 4, color ="#dbebfa",fontface = "bold")+
+  scale_color_manual(values = c("#0061d5", "#8b8c8d", "#e42313"))+
+  scale_fill_manual(values = c("#e07e35", "#d1392b", "#2a5522","#f2cca0","#a9c4e6","#818181"))+
+  theme_classic()+
+  theme(axis.line.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line.y = element_line(linewidth = 0.8),
+        axis.text.y = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 14, color = "black"),
+        axis.ticks.y = element_line(linewidth = 0.8))+
+  labs(x = "group", y = "Log2FoldChange", fill= NULL, color = NULL)+
+  guides(color=guide_legend(override.aes = list(size=6,alpha=1)))
+color <- colorRampPalette(brewer.pal(11,"BrBG"))(30)
+grid.raster(alpha(color, 0.2), 
+            width = unit(1, "npc"), 
+            height = unit(1,"npc"),
+            interpolate = T)
+
+ ##05 Heatmap
+library(pheatmap)
+mydata <- read.table("binquant.txt",header = T,
+                     sep = "\t",row.names = 1,check.names = F,stringsAsFactors = F)
+mapping <- read.delim("group3.txt",header = T,row.names = 1,
+                      sep = "\t",stringsAsFactors = F)
+#rownames(mapping)=rownames(mydata)
+colors=list(state=c(ADE = "#cc88b0",
+                    CRC = "#998db7",
+                    Healthy = "#87b5b2",
+                    HCC = "#f4ceb4"))
+pheatmap(mydata,annotation_row  = mapping,
+         cluster_cols = T, cluster_rows = F, scale = "row",
+         #treeheight_col = 0, treeheight_row = 0,
+         display_numbers = F,
+         border_color = "black",
+         color = colorRampPalette(c("blue","white", "red"))(length(mydata)),
+         annotation_colors=colors)
+
+
+
+
+
